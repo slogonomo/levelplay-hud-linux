@@ -1,0 +1,12 @@
+[Unit]
+Description=Levelplay HUD AIO pump display feeder
+
+[Service]
+# Seconds between display updates (the Windows driver uses 0.5)
+Environment=HUD_INTERVAL=2
+ExecStart=/usr/bin/python3 -I /usr/local/bin/levelplay-hud
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

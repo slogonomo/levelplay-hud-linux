@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""Feed live CPU stats to the Levelplay Combat Liquid HUD pump display
+(HWCX 0145:1001). See PROTOCOL.md: one handshake packet on open, then a
+65-byte status packet per update (the Windows driver sends one every
+500 ms; this defaults to every 2 s, averaged, which is calmer to look at).
+Runs as root (RAPL energy counters are root-only). Survives replug and
+suspend by re-finding the device whenever a write fails."""
+import datetime, glob, os, random, select, sys, time
+
+VID_PID = ("0145", "1001")
+SAMPLE = 0.5  # how often temperature and clock are sampled
+INTERVAL = float(os.environ.get("HUD_INTERVAL", "2"))  # how often the display updates
+
+
+def log(*a):
+    print(*a, file=sys.stderr, flush=True)
+
+
+def find_hidraw():
+    for dev in glob.glob("/sys/class/hidraw/hidraw*"):
+        try:
+            uevent = open(os.path.join(dev, "device/uevent")).read()
+        except OSError:
+            continue
+        # HID_ID=0003:00000145:00001001
+        for line in uevent.splitlines():
+            if line.startswith("HID_ID="):
+                _, vid, pid = line[7:].split(":")
+                if (vid[-4:].lower(), pid[-4:].lower()) == VID_PID:
+                    return "/dev/" + os.path.basename(dev)
+    return None
+
+
+# --- protocol -----------------------------------------------------------
+
+def _xor_ck(b):
+    c = 0
+    for i in range(60):
+        c ^= (i * b[1 + i]) & 0xFF
+    return c
+
+
+def _sum_ck(b):
+    return sum(i * b[1 + i] for i in range(63)) & 0xFF
+
+
+def handshake(fd):
+    b = bytearray(random.getrandbits(8) for _ in range(65))
+    k = random.getrandbits(16)
+    b[0:5] = b"\x00\x01\x00\x00\x00"
+    b[5], b[6] = k >> 8, k & 0xFF
+    w = (k ^ ((((b[7] + b[9]) << 8) + b[8] + b[10]) & 0xFFFF)) & 0xFFFF
+    b[11], b[12] = w >> 8, w & 0xFF
+    b[63] = _xor_ck(b)
+    b[64] = _sum_ck(b)
+    expect = (((b[9] << 8) | b[10]) ^ ((((b[5] + b[7]) << 8) + b[8] + b[6]) & 0xFFFF)) & 0xFFFF
+    os.write(fd, bytes(b))
+    if not select.select([fd], [], [], 2)[0]:
+        return False
+    r = b"\x00" + os.read(fd, 64)
+    return ((r[5] << 8) | r[6]) == expect and r[63] == _xor_ck(r) and r[64] == _sum_ck(r)
+
+
+def data_packet(s):
+    now = datetime.datetime.now()
+    b = bytearray(65)
+    b[1] = 0x02
+    b[2] = s["temp"]
+    b[4], b[5], b[6] = now.hour, now.minute, now.second
+    b[7] = now.microsecond // 10000
+    b[8], b[9] = now.year // 100, now.year % 100
+    b[10], b[11] = now.month, now.day
+    b[12] = (now.weekday() + 1) % 7  # .NET DayOfWeek, Sunday = 0
+    b[13] = s["load"]
+    b[14], b[15] = s["mhz"] >> 8, s["mhz"] & 0xFF
+    b[20] = s["mem"]
+    w10 = min(s["watts10"], 0xFFFF)
+    b[29], b[30] = w10 >> 8, w10 & 0xFF
+    return bytes(b)
+
+
+# --- sensors ------------------------------------------------------------
+
+def hwmon(name):
+    for h in glob.glob("/sys/class/hwmon/hwmon*"):
+        try:
+            if open(h + "/name").read().strip() == name:
+                return h
+        except OSError:
+            pass
+    return None
+
+
+RAPL = "/sys/class/powercap/intel-rapl:0"
+
+
+def cpu_temp_input():
+    """temp*_input of the CPU package sensor: AMD Tctl or Intel package."""
+    for name, label in (("k10temp", "Tctl"), ("zenpower", "Tctl"), ("coretemp", "Package id 0")):
+        h = hwmon(name)
+        if not h:
+            continue
+        for lbl in sorted(glob.glob(h + "/temp*_label")):
+            if open(lbl).read().strip() == label:
+                return lbl.replace("_label", "_input")
+        return h + "/temp1_input"
+    raise SystemExit("no CPU temperature sensor found (k10temp, zenpower or coretemp)")
+
+
+class Sensors:
+    def __init__(self):
+        self.temp_input = cpu_temp_input()
+        try:
+            self.rapl_max = self._read_int(RAPL + "/max_energy_range_uj")
+            self._energy()
+        except OSError:
+            log("no RAPL energy counter, reporting 0 W")
+            self.rapl_max = None
+        self.freqs = glob.glob("/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq")
+        self.temps, self.mhzs = [], []
+        self.prev_stat = self._stat()
+        self.prev_energy = (self._energy(), time.monotonic())
+
+    @staticmethod
+    def _read_int(path):
+        with open(path) as f:
+            return int(f.read())
+
+    def _stat(self):
+        with open("/proc/stat") as f:
+            v = [int(x) for x in f.readline().split()[1:]]
+        idle = v[3] + v[4]
+        return idle, sum(v)
+
+    def _energy(self):
+        return self._read_int(RAPL + "/energy_uj") if self.rapl_max else 0
+
+    def sample(self):
+        """Accumulate the instantaneous readings; read() reports their mean."""
+        self.temps.append(self._read_int(self.temp_input))  # m°C
+        self.mhzs.append(max(self._read_int(f) for f in self.freqs) // 1000)
+
+    def read(self):
+        if not self.temps:
+            self.sample()
+        temp = round(sum(self.temps) / len(self.temps) / 1000)
+        mhz = round(sum(self.mhzs) / len(self.mhzs))
+        self.temps, self.mhzs = [], []
+
+        # load and power are deltas, so they already average over the interval
+        idle, total = self._stat()
+        pidle, ptotal = self.prev_stat
+        self.prev_stat = (idle, total)
+        dt = total - ptotal
+        load = round(100 * (1 - (idle - pidle) / dt)) if dt else 0
+
+        e, t = self._energy(), time.monotonic()
+        pe, pt = self.prev_energy
+        self.prev_energy = (e, t)
+        de = (e - pe) % self.rapl_max if self.rapl_max else 0
+        watts10 = round(de / (t - pt) / 1e5) if t > pt else 0
+
+        with open("/proc/meminfo") as f:
+            m = dict(l.split(":", 1) for l in f)
+        tot = int(m["MemTotal"].split()[0])
+        avail = int(m["MemAvailable"].split()[0])
+        mem = round(100 * (tot - avail) / tot)
+
+        clamp = lambda x: max(0, min(255, x))
+        return {"temp": clamp(temp), "load": clamp(load), "mhz": min(mhz, 0xFFFF),
+                "watts10": watts10, "mem": clamp(mem)}
+
+
+# --- main loop ----------------------------------------------------------
+
+def main():
+    sensors = Sensors()
+    fd = None
+    while True:
+        if fd is None:
+            path = find_hidraw()
+            if path is None:
+                time.sleep(2)
+                continue
+            try:
+                fd = os.open(path, os.O_RDWR)
+                if handshake(fd):
+                    log(f"connected to {path}")
+                else:
+                    log(f"{path}: handshake reply missing or wrong, sending anyway")
+            except OSError as e:
+                log(f"{path}: {e}")
+                if fd is not None:
+                    os.close(fd)
+                fd = None
+                time.sleep(2)
+                continue
+        try:
+            os.write(fd, data_packet(sensors.read()))
+        except OSError as e:
+            log(f"write failed ({e}), reconnecting")
+            os.close(fd)
+            fd = None
+            time.sleep(1)
+            continue
+        deadline = time.monotonic() + INTERVAL
+        while (left := deadline - time.monotonic()) > 0:
+            time.sleep(min(SAMPLE, left))
+            sensors.sample()
+
+
+if __name__ == "__main__":
+    main()
