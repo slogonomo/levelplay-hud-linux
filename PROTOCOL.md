@@ -87,12 +87,17 @@ sends one every 2 s, and the display stays lit.
 | 37-40 | 0 | vendor code |
 | 41-44 | network upload, u32 | vendor code |
 | 45-48 | network download, u32 | vendor code |
-| 49 | display mode (the service always sends 0) | vendor code |
+| 49 | display mode (the service always sends 0) | tested: 0x00-0x04 and 0x80-0x83 change nothing on the Levelplay HUD |
 | 50-64 | 0 | |
 
 The Levelplay HUD shows CPU temperature, power, clock and load, plus a bar
 meter and an arc gauge driven from those values. The other fields are sent by
 the shared vendor code and may be used by sibling products.
+
+The DLL's `SetDisplayMode(a, mode)` export stores `mode` in byte 49, setting
+bit 7 when `a` is 0. The Levelplay service never calls it, and the CyberPower
+logo and the layout stayed the same with every value tried. The byte is
+probably meant for sibling products.
 
 On a failed write the vendor code reopens the device and retries, up to 15
 times with 20 ms between tries.
